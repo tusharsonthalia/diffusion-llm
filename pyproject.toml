@@ -1,0 +1,11 @@
+[project]
+name = "diffusion-llm"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "einops>=0.8.2",
+    "jaxtyping>=0.3.11",
+    "torch>=2.14.1",
+]
