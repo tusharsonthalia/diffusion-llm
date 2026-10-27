@@ -5,6 +5,8 @@ from einops import einsum, rearrange
 from jaxtyping import Bool, Float, Int
 from torch import Tensor, nn
 
+from model.kv_cache import KVCache
+
 
 class Linear(nn.Module):
     """A bias-free linear transformation, y = x @ W.T.
@@ -326,7 +328,9 @@ class BidirectionalMultiHeadAttention(nn.Module):
     """Multi-head self-attention with RoPE and a fused QKV projection.
 
     Bidirectional: with mask=None every position attends to every position (no
-    causal mask). An optional boolean mask (True = may attend) is supported.
+    causal mask). An optional boolean mask (True = may attend) is supported, and an
+    optional KV cache lets new tokens attend to previously committed ones without 
+    recomputing them.
 
     Args:
         d_model (int): Model dimension. Must be divisible by n_heads.
@@ -366,6 +370,9 @@ class BidirectionalMultiHeadAttention(nn.Module):
         x: Float[Tensor, "... seq d_model"],
         mask: Bool[Tensor, "... seq_q seq_k"] | None = None,
         positions: Int[Tensor, " seq"] | None = None,
+        kv_cache: KVCache | None = None,
+        layer_idx: int = 0,
+        store: bool = False,
     ) -> Float[Tensor, "... seq d_model"]:
         """Attend over the sequence.
 
@@ -374,11 +381,17 @@ class BidirectionalMultiHeadAttention(nn.Module):
             mask: Boolean, True = may attend, broadcastable to
                 (..., n_heads, seq_q, seq_k). None = full bidirectional attention.
             positions: Shape (seq,), absolute positions for RoPE. Defaults to
-                0 .. seq-1.
+                0 .. seq-1. With a cache, pass the new tokens' true positions
+                (cache.length ..), not 0 .. seq-1.
+            kv_cache: Optional cache of committed tokens' post-RoPE K/V.
+            layer_idx: Which cache slot this layer reads and writes.
+            store: Append this call's K/V to the cache (after attending).
 
         Returns:
             Tensor of shape (..., seq, d_model).
         """
+        assert not store or kv_cache is not None, "store=True needs a kv_cache to store into"
+
         qkv_proj = self.qkv(x)
 
         # split the fused axis (three, heads, d_k)
@@ -393,8 +406,19 @@ class BidirectionalMultiHeadAttention(nn.Module):
         q = self.rope(q, positions)
         k = self.rope(k, positions)
 
+        k_all, v_all = k, v
+        if kv_cache is not None:
+            k_cache, v_cache = kv_cache.get(layer_idx)
+            if k_cache is not None and v_cache is not None:
+                k_all = torch.cat([k_cache, k], dim=-2)
+                v_all = torch.cat([v_cache, v], dim=-2)
+
+        if store and kv_cache is not None:
+            kv_cache.append(layer_idx, k, v)
+
+        o = scaled_dot_product_attention(q, k_all, v_all, mask)
+
         # merge heads back: (..., n_heads, seq, d_k) -> (..., seq, d_model)
-        o = scaled_dot_product_attention(q, k, v, mask)
         o = rearrange(o, "... n_heads seq d_k -> ... seq (n_heads d_k)")
 
         return self.out(o)
@@ -516,6 +540,9 @@ class DiTBlock(nn.Module):
         c: Float[Tensor, "... d_cond"],
         mask: Bool[Tensor, "... seq seq"] | None = None,
         positions: Int[Tensor, " seq"] | None = None,
+        kv_cache: KVCache | None = None,
+        layer_idx: int = 0,
+        store: bool = False,
     ) -> Float[Tensor, "... seq d_model"]:
         """Apply the block.
 
@@ -524,13 +551,18 @@ class DiTBlock(nn.Module):
             c: Shape (batch, d_cond), the conditioning vector.
             mask: Boolean, True = may attend. None = full bidirectional attention.
             positions: Shape (seq,), absolute positions for RoPE.
+            kv_cache, layer_idx, store: Passed through to attention (the MLP and
+                adaLN don't use the cache).
 
         Returns:
             Tensor of shape (batch, seq, d_model).
         """
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.ada_ln(c)
 
-        h = x + gate_msa * self.attn(modulate(self.ln1(x), shift_msa, scale_msa), mask, positions)
+        h = x + gate_msa * self.attn(
+                                modulate(self.ln1(x), shift_msa, scale_msa), 
+                                mask, positions, kv_cache, layer_idx, store
+                            )
         out = h + gate_mlp * self.mlp(modulate(self.ln2(h), shift_mlp, scale_mlp))
 
         return out
@@ -663,6 +695,8 @@ class DiT(nn.Module):
         sigma: Float[Tensor, " batch"],
         mask: Bool[Tensor, "... seq seq"] | None = None,
         positions: Int[Tensor, " seq"] | None = None,
+        kv_cache: KVCache | None = None,
+        store: bool = False,
     ) -> Float[Tensor, "... seq vocab"]:
         """Run the backbone.
 
@@ -672,6 +706,8 @@ class DiT(nn.Module):
             mask: Boolean attention mask, True = may attend. None = full
                 bidirectional attention.
             positions: Shape (seq,), absolute positions for RoPE (BD3-LM).
+            kv_cache: Optional KVCache, owned by the caller.
+            store: Commit this call's tokens' K/V to the cache in every layer.
 
         Returns:
             Raw logits of shape (batch, seq, vocab_size).
@@ -681,8 +717,8 @@ class DiT(nn.Module):
 
         x = self.token_embeddings(tokens)
 
-        for layer in self.layers:
-            x = layer(x, c, mask, positions)
+        for layer_idx, layer in enumerate(self.layers):
+            x = layer(x, c, mask, positions, kv_cache, layer_idx, store)
 
         x = self.final_layer(x, c)
 

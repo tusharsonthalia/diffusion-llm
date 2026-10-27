@@ -2,6 +2,7 @@ import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor, nn
 
+from model.kv_cache import KVCache
 from model.modules import DiT
 from model.subs import subs_parameterization
 
@@ -135,3 +136,95 @@ class BD3LM(nn.Module):
         logits = self.backbone(x_input, sigma, mask=self.attn_mask, positions=self.positions)[:, :n]
 
         return subs_parameterization(logits, xt, self.mask_index)
+
+    def block_logprobs(
+        self,
+        x_accum: Int[Tensor, "batch seq"],
+    ) -> Float[Tensor, "batch block vocab"]:
+        """Sampling-time forward WITHOUT a KV cache: SUBS log-probs for the current block.
+
+        x_accum is the committed clean blocks followed by the current (partially masked)
+        block. The whole sequence is re-encoded under the block-causal mask, so the clean
+        blocks get exactly the hidden states the clean half had in training, and the
+        current block sees all clean history plus itself. Only the last block is scored.
+
+        Args:
+            x_accum: Shape (batch, L), L a multiple of block_size and <= max_seq_len.
+
+        Returns:
+            Log-probs of shape (batch, block_size, vocab) for the last block.
+        """
+        seq_len = x_accum.shape[1]
+        n, bs = self.max_seq_len, self.block_size
+        assert seq_len <= n and seq_len % bs == 0, (
+            f"accumulated length {seq_len} must be a multiple of block_size {bs} and <= {n}"
+        )
+
+        sigma = torch.zeros(x_accum.shape[0], device=x_accum.device)
+
+        causal_mask = self.attn_mask[n:n + seq_len, n:n + seq_len]
+
+        positions = self.positions[:seq_len]
+
+        logits = self.backbone(x_accum, sigma, mask=causal_mask, positions=positions)[:, -bs:]
+
+        return subs_parameterization(logits, x_accum[:, -bs:], self.mask_index)
+
+    @torch.no_grad()
+    def cached_block_logprobs(
+        self,
+        block: Int[Tensor, "batch block"],
+        kv_cache: KVCache,
+    ) -> Float[Tensor, "batch block vocab"]:
+        """Sampling-time forward WITH a KV cache: SUBS log-probs for the current block.
+
+        Only the block's B tokens are run. In every layer their queries attend to the
+        cached K/V of all committed blocks plus the block's own K/V (no mask).
+
+        Args:
+            block: Shape (batch, block_size), the current (partially masked) block.
+            kv_cache: The sampling run's cache of committed blocks (may be empty).
+
+        Returns:
+            Log-probs of shape (batch, block_size, vocab).
+        """
+        bs = self.block_size
+        assert block.shape[1] == bs, f"expected a block of {bs} tokens, got {block.shape[1]}"
+
+        # the block sits right after the committed history
+        start = kv_cache.length
+        assert start + bs <= self.max_seq_len, (
+            f"cache length {start} + block {bs} exceeds max_seq_len {self.max_seq_len} (RoPE table size)"
+        )
+        positions = torch.arange(start, start + bs, device=block.device)
+        sigma = torch.zeros(block.shape[0], device=block.device)
+
+        logits = self.backbone(block, sigma, positions=positions, kv_cache=kv_cache)
+
+        return subs_parameterization(logits, block, self.mask_index)
+
+    @torch.no_grad()
+    def commit_block(
+        self,
+        block: Int[Tensor, "batch block"],
+        kv_cache: KVCache,
+    ) -> None:
+        """Append a finished (fully unmasked) block's K/V to the cache, in every layer.
+
+        Args:
+            block: Shape (batch, block_size), the finished block (no [MASK] tokens).
+            kv_cache: The sampling run's cache; grows by block_size tokens.
+        """
+        bs = self.block_size
+        assert block.shape[1] == bs, f"expected a block of {bs} tokens, got {block.shape[1]}"
+        assert not (block == self.mask_index).any(), "only fully unmasked blocks can be committed"
+
+        # read the offset once, up front: kv_cache.length grows as soon as layer 0 appends
+        start = kv_cache.length
+        assert start + bs <= self.max_seq_len, (
+            f"cache length {start} + block {bs} exceeds max_seq_len {self.max_seq_len} (RoPE table size)"
+        )
+        positions = torch.arange(start, start + bs, device=block.device)
+        sigma = torch.zeros(block.shape[0], device=block.device)
+
+        self.backbone(block, sigma, positions=positions, kv_cache=kv_cache, store=True)
