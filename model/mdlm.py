@@ -2,7 +2,8 @@ import torch
 from jaxtyping import Float, Int
 from torch import Tensor, nn
 
-from model.modules import DiT, log_softmax
+from model.modules import DiT
+from model.subs import subs_parameterization
 
 
 class MDLM(nn.Module):
@@ -32,7 +33,7 @@ class MDLM(nn.Module):
         self, 
         xt: Int[Tensor, "batch seq"],
         sigma: Float[Tensor, " batch"],
-    ):
+    ) -> Float[Tensor, "batch seq vocab"]:
         if not self.time_conditioning:
             sigma = torch.zeros_like(sigma)
 
@@ -40,24 +41,3 @@ class MDLM(nn.Module):
 
         return subs_parameterization(logits, xt, self.mask_index)
 
-
-def subs_parameterization(
-    logits: Float[Tensor, "batch seq vocab"],
-    xt: Int[Tensor, "batch seq"], 
-    mask_index: int,
-) -> Float[Tensor, "batch seq vocab"]:
-    # large finite stand-in for -inf
-    penalty = -1e6
-
-    # rule 1: zero mass on [MASK], then normalize.
-    bias = torch.zeros(logits.shape[-1], device=logits.device, dtype=logits.dtype)
-    bias[mask_index] = penalty
-    log_probs = log_softmax(logits + bias, dim=-1)
-
-    # rule 2: one-hot rows (0 at x_t's token, penalty elsewhere).
-    carry = torch.full_like(log_probs, penalty).scatter(-1, xt.unsqueeze(-1), 0.0)
-
-    # (batch, seq, 1): broadcasts the per-position choice across the vocab axis
-    unmasked = (xt != mask_index).unsqueeze(-1)
-
-    return torch.where(unmasked, carry, log_probs)
