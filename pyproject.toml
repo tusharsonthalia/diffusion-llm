@@ -9,3 +9,13 @@ dependencies = [
     "jaxtyping>=0.3.11",
     "torch>=2.14.1",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+filterwarnings = ["ignore:Failed to initialize NumPy"]
