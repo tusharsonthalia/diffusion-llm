@@ -1,6 +1,9 @@
 import torch
-from jaxtyping import Float, Int
+from jaxtyping import Bool, Float, Int
 from torch import Tensor
+
+from model.mdlm import MDLM
+from train.noise import LogLinearNoise
 
 
 def sample_t(
@@ -61,3 +64,47 @@ def q_xt(
     mask_positions = token_probs < move_chance.reshape(-1, 1)
 
     return torch.where(mask_positions, mask_index, x0)
+
+
+def mdlm_loss(
+    model: MDLM,
+    noise: LogLinearNoise,
+    x0: Int[Tensor, "batch seq"],
+    attention_mask: Bool[Tensor, "batch seq"] | None = None,
+    sampling_eps: float = 1e-3,
+) -> Float[Tensor, ""]:
+    """Continuous-time MDLM loss (negative ELBO with the SUBS parameterization):
+
+        L = E_t [ dsigma(t) / (exp(sigma(t)) - 1) * sum_l -log x_theta^l(x_t)[x0^l] ]
+
+    Args:
+        model (MDLM): Returns SUBS log-probs from forward(xt, sigma).
+        noise (LogLinearNoise): The noise schedule.
+        x0: Shape (batch, seq), clean token ids (no [MASK]).
+        attention_mask: Shape (batch, seq), True = count this position. None =
+            every position counts.
+        sampling_eps (float): Smallest t that can be sampled.
+
+    Returns:
+        Scalar: summed weighted NLL divided by the number of counted tokens.
+    """
+    t = sample_t(x0.shape[0], sampling_eps, device=x0.device)
+    sigma, dsigma = noise(t)
+
+    move_chance = -torch.expm1(-sigma)
+    xt = q_xt(x0, move_chance, model.mask_index)
+
+    # SUBS log-probs (batch, seq, vocab) -> log-prob of the clean token (batch, seq)
+    log_probs = model(xt, sigma)
+    log_p_x0 = log_probs.gather(-1, x0.unsqueeze(-1)).squeeze(-1)
+
+    # per-sequence weight, (batch,) -> (batch, 1) to broadcast over positions
+    weight = dsigma / torch.expm1(sigma)
+    nll = -log_p_x0 * weight.unsqueeze(-1)
+
+    if attention_mask is None:
+        return nll.mean()
+
+    # excluded positions drop out of both the numerator and the token count
+    token_mask = attention_mask.to(nll.dtype)
+    return (nll * token_mask).sum() / token_mask.sum()
