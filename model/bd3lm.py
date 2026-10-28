@@ -35,7 +35,7 @@ def block_diff_mask(
     queries = torch.arange(2 * seq_len, device=device).reshape(-1, 1)
     keys = torch.arange(2 * seq_len, device=device).reshape(1, -1)
 
-    # segmenting the QK^T mask into four segments, 
+    # the (2n, 2n) mask splits into four quadrants:
     #           [noisy, noisy] | [noisy, clean]
     #           [clean, noisy] | [clean, clean]
     q_clean, k_clean = queries >= seq_len, keys >= seq_len
@@ -44,12 +44,13 @@ def block_diff_mask(
     q_block = (queries % seq_len) // block_size
     k_block = (keys % seq_len) // block_size
 
-    # getting the mask on 3 of the 4 segnments
+    # three of the four quadrants have allowed entries (clean -> noisy is all False)
     block_diagonal = ~q_clean & ~k_clean & (q_block == k_block)
     offset_block_causal = ~q_clean & k_clean & (k_block < q_block)
     block_causal = q_clean & k_clean & (k_block <= q_block)
 
     return block_diagonal | offset_block_causal | block_causal
+
 
 class BD3LM(nn.Module):
     """Block diffusion LM: autoregressive over blocks, masked diffusion within each.
@@ -74,6 +75,7 @@ class BD3LM(nn.Module):
         backbone (DiT): The shared diffusion transformer.
         attn_mask (Tensor): (2n, 2n) block diffusion mask.
         positions (Tensor): (2n,) RoPE positions arange(n) repeated twice.
+        n_layers (int): Number of DiT layers (sizes the sampler's KVCache).
     """
     attn_mask: Bool[Tensor, "two_seq_len two_seq_len"]
     positions: Int[Tensor, " two_seq_len"]
@@ -104,6 +106,7 @@ class BD3LM(nn.Module):
         self.mask_index = vocab_size - 1
         self.max_seq_len = max_seq_len
         self.block_size = block_size
+        self.n_layers = n_layers
 
         # both are fully determined by (n, block_size): build once, never save
         self.register_buffer(
