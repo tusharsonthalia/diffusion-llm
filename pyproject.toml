@@ -12,6 +12,12 @@ dependencies = [
 ]
 
 [dependency-groups]
+data = [
+    "huggingface-hub>=2.3.0",
+    "numpy>=2.5.4",
+    "pyarrow>=26.0.0",
+    "tiktoken>=0.14.0",
+]
 dev = [
     "pytest>=9.1.1",
 ]

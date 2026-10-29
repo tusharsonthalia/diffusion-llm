@@ -5,6 +5,7 @@ Usage (from the repo root):
     uv run modal run infra/modal_app.py::env_check      # just the GPU / Triton / profiler check
     uv run modal run infra/modal_app.py::run_tests      # just the test suite
     uv run modal run infra/modal_app.py::nsight_check   # nsys + ncu on a real kernel
+    uv run modal run infra/modal_app.py::prepare_data --shards 4   # OpenWebText -> /vol/data (CPU)
 
 GPU policy (PLAN.md): cheap GPUs (T4 / L4 / A10G) for correctness, H100 only for final
 benchmarks and profiles. Override per call with GPU=L4 uv run modal run ....
@@ -177,6 +178,28 @@ def run_tests(pytest_args: str = "-q") -> int:
 
     result = subprocess.run(["python", "-m", "pytest", *pytest_args.split()], cwd=REMOTE, check=False)
     return result.returncode
+
+
+# data prep is CPU-only: a slim image without torch / Nsight, plus the repo's scripts/
+data_image = (
+    modal.Image.debian_slim(python_version="3.13")
+    .uv_pip_install("tiktoken>=0.14.0", "pyarrow>=26.0.0", "numpy", "huggingface_hub>=2.3.0")
+    .env({"HF_HOME": f"{VOL}/hf"})
+    .add_local_dir(REPO / "scripts", remote_path=f"{REMOTE}/scripts")
+)
+
+
+@app.function(image=data_image, cpu=8, memory=16 * 1024, volumes={VOL: volume}, timeout=3 * 60 * 60)
+def prepare_data(shards: int = 4, val_docs: int = 5000) -> None:
+    """Download + tokenize OpenWebText onto the Volume at /vol/data/openwebtext (CPU only)."""
+    import subprocess
+
+    subprocess.run(
+        ["python", f"{REMOTE}/scripts/prepare_data.py", "--out-dir", f"{VOL}/data/openwebtext",
+         "--shards", str(shards), "--val-docs", str(val_docs), "--threads", "8"],
+        check=True,
+    )
+    volume.commit()  # make the files visible to other containers right away
 
 
 @app.local_entrypoint()
