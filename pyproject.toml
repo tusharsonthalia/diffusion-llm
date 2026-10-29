@@ -7,6 +7,7 @@ requires-python = ">=3.13"
 dependencies = [
     "einops>=0.8.2",
     "jaxtyping>=0.3.11",
+    "modal>=1.6.3",
     "torch>=2.14.1",
 ]
 
