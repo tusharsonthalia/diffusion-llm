@@ -4,6 +4,7 @@ Usage (from the repo root):
     uv run modal run infra/modal_app.py::prepare_data --shards 4
     uv run modal run infra/modal_app.py::run_tests
     uv run modal run infra/modal_app.py::ablation --batch-size 8
+    uv run modal run infra/modal_app.py::bench_attention
 
 Every compared benchmark / profile runs on an A100-80GB; tests run on a T4.
 
@@ -188,3 +189,22 @@ def ablation(batch_size: int, passes: str = "timing,nsys"):
         print(f"=== {p} pass ({len(jobs)} runs, batch {batch_size})")
         for res in train.starmap(jobs):
             print(f"{res['name']:34s} exit={res['exit']} | {res['summary']}")
+
+
+# ---------------------------------------------------------------------------
+# Attention microbenchmark: forward / backward of every backend on the
+# BD3-LM mask at long sequences (bench/attention_bench.py)
+# ---------------------------------------------------------------------------
+
+@app.function(gpu="A100-80GB", volumes={VOL: volume}, timeout=60 * 60)
+def bench_attention(name: str = "sweep") -> int:
+    """One attention_bench run; writes results.json (timings,
+    memory, TFLOPS, GPU name) and log.txt to /vol/runs/attention/<name>/.
+    """
+    out = f"{RUNS}/attention/{name}"
+    Path(out).mkdir(parents=True, exist_ok=True)
+    cmd = ["python", "-m", "bench.attention_bench", "--out-dir", out]
+    r = _run(cmd, f"{out}/log.txt")
+    volume.commit()
+    print(r.stdout[-6000:] + r.stderr[-2000:])
+    return r.returncode
