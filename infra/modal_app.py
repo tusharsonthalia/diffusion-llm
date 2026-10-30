@@ -1,12 +1,17 @@
-"""Modal app: data prep, tests on a GPU, and the training ablation.
+"""Modal app: data prep, tests on a GPU, the training ablation, and the
+inference ladder / profiles.
 
 Usage (from the repo root):
     uv run modal run infra/modal_app.py::prepare_data --shards 4
     uv run modal run infra/modal_app.py::run_tests
     uv run modal run infra/modal_app.py::ablation --batch-size 8
     uv run modal run infra/modal_app.py::bench_attention
+    uv run modal run infra/modal_app.py::inference_ladder
+    uv run modal run infra/modal_app.py::ncu_decode --shape cached \
+        --kernel split_kv
 
-Every compared benchmark / profile runs on an A100-80GB; tests run on a T4.
+Training benchmarks / profiles run on an A100-80GB, inference ones on an
+A100-40GB; tests run on a T4.
 
 Lives in infra/ rather than modal/: a top-level `modal/` directory can
 shadow the real `modal` package on sys.path.
@@ -91,6 +96,26 @@ def _run(cmd: list[str], log_path: str | None = None):
     return r
 
 
+def _nsys(cmd: list[str], out: str, log_path: str | None = None):
+    # cmd under nsys (cudaProfilerApi range), then the summary stats
+    r = _run([
+        "nsys", "profile", "--trace=cuda,nvtx,osrt",
+        "--capture-range=cudaProfilerApi", "--capture-range-end=stop",
+        "--force-overwrite=true", "-o", f"{out}/report", *cmd,
+    ], log_path)
+    if r.returncode == 0:
+        stats = _run([
+            "nsys", "stats", "--force-export=true", "--report",
+            # nvtx_gpu_proj_sum: GPU time of each NVTX range, measured
+            # from the kernels launched inside it
+            "cuda_gpu_kern_sum,cuda_gpu_mem_time_sum,cuda_api_sum,"
+            "nvtx_sum,nvtx_gpu_proj_sum",
+            f"{out}/report.nsys-rep",
+        ])
+        Path(f"{out}/nsys_stats.txt").write_text(stats.stdout + stats.stderr)
+    return r
+
+
 @app.function(image=data_image, cpu=8, memory=16 * 1024,
               volumes={VOL: volume}, timeout=3 * 60 * 60)
 def prepare_data(shards: int = 4, val_docs: int = 5000) -> None:
@@ -152,26 +177,8 @@ def train(name: str, args: str, nsys: bool = False) -> dict:
     out = f"{RUNS}/{'nsys' if nsys else 'timing'}/{name}"
     Path(out).mkdir(parents=True, exist_ok=True)
     cmd = ["python", "-m", "train.train", *args.split(), "--out-dir", out]
-
-    if nsys:
-        cmd = [
-            "nsys", "profile", "--trace=cuda,nvtx,osrt",
-            "--capture-range=cudaProfilerApi", "--capture-range-end=stop",
-            "--force-overwrite=true", "-o", f"{out}/report", *cmd,
-        ]
-    r = _run(cmd, f"{out}/log.txt")
-
-    if nsys and r.returncode == 0:
-        stats = _run([
-            "nsys", "stats", "--force-export=true",
-            # nvtx_gpu_proj_sum: GPU time of each NVTX range (attention,
-            # forward, ...), measured from the kernels launched inside it
-            "--report",
-            "cuda_gpu_kern_sum,cuda_gpu_mem_time_sum,nvtx_sum,"
-            "nvtx_gpu_proj_sum",
-            f"{out}/report.nsys-rep",
-        ])
-        Path(f"{out}/nsys_stats.txt").write_text(stats.stdout + stats.stderr)
+    log = f"{out}/log.txt"
+    r = _nsys(cmd, out, log) if nsys else _run(cmd, log)
 
     volume.commit()
     summary = [ln for ln in r.stdout.splitlines() if ln.startswith("loss ")]
@@ -207,4 +214,55 @@ def bench_attention(name: str = "sweep") -> int:
     r = _run(cmd, f"{out}/log.txt")
     volume.commit()
     print(r.stdout[-6000:] + r.stderr[-2000:])
+    return r.returncode
+
+
+# ---------------------------------------------------------------------------
+# Inference ladder (inference/generate.py): every rung timed, then captured
+# under nsys, one after another in one A100-40GB container
+# ---------------------------------------------------------------------------
+
+# inference/generate.py METHODS, each one built on the previous
+INFERENCE_RUNGS = ["baseline", "bf16", "compile", "kv_cache", "split_kv"]
+
+
+@app.function(gpu="A100-40GB", volumes={VOL: volume}, timeout=2 * 60 * 60)
+def inference_ladder(methods: str = "") -> None:
+    """Writes log.txt (plain run), nsys_log.txt, report.nsys-rep and
+    nsys_stats.txt to /vol/runs/inference/<rung>/. methods: comma-separated
+    subset of INFERENCE_RUNGS (default all).
+    """
+    for name in methods.split(",") if methods else INFERENCE_RUNGS:
+        out = f"{RUNS}/inference/{name}"
+        Path(out).mkdir(parents=True, exist_ok=True)
+        cmd = ["python", "-m", "inference.generate", name]
+        r = _run(cmd, f"{out}/log.txt")
+        print(name, (r.stdout + r.stderr)[-400:], flush=True)
+        r = _nsys(cmd, out, f"{out}/nsys_log.txt")
+        print(name, "nsys exit", r.returncode, flush=True)
+        volume.commit()
+
+
+# ---------------------------------------------------------------------------
+# Nsight Compute of one decode-attention launch (bench/decode_ncu.py)
+# ---------------------------------------------------------------------------
+
+@app.function(gpu="A100-40GB", volumes={VOL: volume}, timeout=30 * 60)
+def ncu_decode(shape: str = "cached", kernel: str = "bsdfa") -> int:
+    """Writes report.ncu-repz and log.txt to /vol/runs/ncu/<kernel>_<shape>/.
+    """
+    out = f"{RUNS}/ncu/{kernel}_{shape}"
+    Path(out).mkdir(parents=True, exist_ok=True)
+    n = 2 if kernel == "split_kv" else 1  # launches per attention call
+    r = _run([
+        # Modal can't lock clocks: profile at the running clocks
+        "ncu", "--set", "full", "--clock-control", "none",
+        "-k", "regex:decode_kern|split_kv",
+        # skip the two warmup calls, profile the third
+        "--launch-skip", str(2 * n), "--launch-count", str(n), "-f",
+        "-o", f"{out}/report", "python", "-m", "bench.decode_ncu",
+        shape, kernel,
+    ], f"{out}/log.txt")
+    volume.commit()
+    print((r.stdout + r.stderr)[-1500:])
     return r.returncode
