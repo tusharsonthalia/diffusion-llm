@@ -1,4 +1,5 @@
 import argparse
+import json
 import statistics
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
@@ -9,6 +10,7 @@ import torch
 from jaxtyping import Int
 from torch import Tensor, nn
 
+from bench.attention import BACKENDS, install_attention
 from bench.harness import log_result
 from model.bd3lm import BD3LM
 from model.mdlm import MDLM
@@ -18,7 +20,9 @@ from train.mdlm_loss import mdlm_loss
 from train.noise import LogLinearNoise
 
 # GPT-2's 50257 tokens + [MASK] (matches meta.json's model_vocab_size)
-DEFAULT_VOCAB_SIZE = 50258
+VOCAB_SIZE = 50258
+
+StepFn = Callable[..., tuple[Tensor, Tensor]]
 
 
 @dataclass
@@ -41,18 +45,27 @@ class TrainConfig:
     lr: float = 3e-4
     weight_decay: float = 0.0
     grad_clip: float = 1.0
+    # optimizations, one flag each
+    step: str = "baseline"              # "baseline" | "overlap"
+    attn: str = "custom"                # "custom" | "sdpa"
+    fused_adam: bool = False
+    compile: bool = False
+    # NVTX ranges around attention fwd + bwd (nsys; eager only)
+    nvtx_attn: bool = False
     # run
     steps: int = 100
     warmup_steps: int = 10              # excluded from timing
+    profile_steps: int = 0              # >0: cudaProfiler range for nsys
     sync_debug: bool = False            # warn on GPU->CPU syncs in the loop
     amp_dtype: str = "bf16"             # "bf16" | "fp32"
     seed: int = 0
+    out_dir: str = ""                   # write config.json + metrics.json
 
 
-def build_model(cfg: TrainConfig, vocab_size: int) -> nn.Module:
+def build_model(cfg: TrainConfig) -> nn.Module:
     """MDLM or BD3-LM with the configured DiT backbone."""
     common = {
-        "vocab_size": vocab_size,
+        "vocab_size": VOCAB_SIZE,
         "max_seq_len": cfg.seq_len,
         "d_model": cfg.d_model,
         "n_heads": cfg.n_heads,
@@ -92,18 +105,14 @@ def train_step(
     model: nn.Module,
     noise: LogLinearNoise,
     optimizer: torch.optim.Optimizer,
-    next_batch: Callable[[], np.ndarray],
+    x0: Int[Tensor, "batch seq"],
     amp_dtype: torch.dtype | None,
 ) -> tuple[Tensor, Tensor]:
-    """One complete training step.
+    """Forward, backward and optimizer update on a batch already on the GPU.
 
-    Returns (loss, pre-clip grad norm) as 0-d DEVICE tensors.
+    Shared by every step variant: they differ only in how x0 gets there.
+    Returns (loss, pre-clip grad norm) as 0-d device tensors.
     """
-    # pinned + non_blocking memory transfer
-    with torch.cuda.nvtx.range("data"):
-        x0 = torch.from_numpy(next_batch())
-        x0 = x0.pin_memory().to("cuda", non_blocking=True)
-
     with torch.cuda.nvtx.range("forward"), torch.autocast(
         device_type="cuda",
         dtype=amp_dtype or torch.bfloat16,
@@ -124,15 +133,92 @@ def train_step(
     return loss.detach(), grad_norm
 
 
-def main(cfg: TrainConfig) -> None:
-    torch.manual_seed(cfg.seed)
-    amp_dtype = {"bf16": torch.bfloat16, "fp32": None}[cfg.amp_dtype]
+def to_gpu(batch: np.ndarray) -> Tensor:
+    """Host batch -> GPU without a sync: pinned memory + non_blocking."""
+    return torch.from_numpy(batch).pin_memory().to("cuda", non_blocking=True)
 
+
+def baseline_step(
+    cfg: TrainConfig,
+    model: nn.Module,
+    noise: LogLinearNoise,
+    optimizer: torch.optim.Optimizer,
+    next_batch: Callable[[], np.ndarray],
+    amp_dtype: torch.dtype | None,
+) -> tuple[Tensor, Tensor]:
+    """Fetch this step's batch, copy it on the compute stream, train."""
+    with torch.cuda.nvtx.range("data"):
+        x0 = to_gpu(next_batch())
+
+    return train_step(cfg, model, noise, optimizer, x0, amp_dtype)
+
+
+class OverlapStep:
+    """Prefetch: copy step N+1's batch on a side stream during step N.
+
+    The compute stream only waits for a copy issued one step earlier, which
+    has normally finished by then, so the transfer is off the critical path.
+    """
+
+    def __init__(self):
+        self.copy_stream = torch.cuda.Stream()
+        self.next_x0: Tensor | None = None
+
+    def _prefetch(self, next_batch: Callable[[], np.ndarray]) -> None:
+        with torch.cuda.nvtx.range("prefetch"):
+            host = next_batch()
+            with torch.cuda.stream(self.copy_stream):
+                self.next_x0 = to_gpu(host)
+
+    def __call__(
+        self,
+        cfg: TrainConfig,
+        model: nn.Module,
+        noise: LogLinearNoise,
+        optimizer: torch.optim.Optimizer,
+        next_batch: Callable[[], np.ndarray],
+        amp_dtype: torch.dtype | None,
+    ) -> tuple[Tensor, Tensor]:
+        if self.next_x0 is None:
+            self._prefetch(next_batch)
+
+        # this step's batch: make compute wait for its copy
+        compute = torch.cuda.current_stream()
+        compute.wait_stream(self.copy_stream)
+        x0 = self.next_x0
+        assert x0 is not None
+        x0.record_stream(compute)
+
+        # start the next batch's copy; it runs while this step computes
+        self._prefetch(next_batch)
+
+        return train_step(cfg, model, noise, optimizer, x0, amp_dtype)
+
+
+def make_step(name: str) -> StepFn:
+    """The train-step variant selected by --step."""
+    if name == "baseline":
+        return baseline_step
+    if name == "overlap":
+        return OverlapStep()
+    raise ValueError(f"unknown step {name!r}")
+
+
+def main(cfg: TrainConfig) -> None:
+    assert cfg.steps > cfg.warmup_steps + cfg.profile_steps, (
+        "steps must exceed warmup_steps + profile_steps"
+    )
+    assert cfg.attn in BACKENDS, f"unknown attention backend {cfg.attn!r}"
+    assert not (cfg.nvtx_attn and cfg.compile), (
+        "nvtx_attn graph-breaks torch.compile"
+    )
+
+    torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
     device = torch.device("cuda")
+    amp_dtype = {"bf16": torch.bfloat16, "fp32": None}[cfg.amp_dtype]
 
     # data: the tokenized train split, memory-mapped (never loaded into RAM)
-    vocab_size = DEFAULT_VOCAB_SIZE
     tokens = np.memmap(
         Path(cfg.data_dir) / "train.bin", dtype=np.uint16, mode="r"
     )
@@ -140,19 +226,23 @@ def main(cfg: TrainConfig) -> None:
     def next_batch() -> np.ndarray:
         return draw_random_batch(tokens, cfg.batch_size, cfg.seq_len)
 
-    # model, schedule, optimizer
-    model = build_model(cfg, vocab_size).train()
+    # attention backend first
+    install_attention(cfg.attn, nvtx=cfg.nvtx_attn)
+
+    model = build_model(cfg).train()
+    n_params = sum(p.numel() for p in model.parameters())
+    runner = torch.compile(model) if cfg.compile else model
     noise = LogLinearNoise()
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=cfg.lr,
         betas=(0.9, 0.999),
         weight_decay=cfg.weight_decay,
+        fused=cfg.fused_adam,
     )
-    n_params = sum(p.numel() for p in model.parameters())
+    train_step_fn = make_step(cfg.step)
     print(f"{cfg.model}: {n_params / 1e6:.1f}M params | {asdict(cfg)}")
 
-    torch.cuda.reset_peak_memory_stats(device)
 
     losses = torch.zeros(cfg.steps, device=device)
     grad_norms = torch.zeros(cfg.steps, device=device)
@@ -164,22 +254,30 @@ def main(cfg: TrainConfig) -> None:
         torch.cuda.Event(enable_timing=True) for _ in range(cfg.steps)
     ]
 
+    # nsys capture window: steady-state steps right after warmup
+    profile_start = cfg.warmup_steps
+    profile_end = cfg.warmup_steps + cfg.profile_steps
+
     if cfg.sync_debug:
         torch.cuda.set_sync_debug_mode("warn")
 
     for step in range(cfg.steps):
-        start_events[step].record()
+        if cfg.profile_steps and step == profile_start:
+            torch.cuda.profiler.start()
 
+        start_events[step].record()
         with torch.cuda.nvtx.range(f"step {step}"):
-            loss, grad_norm = train_step(
-                cfg, model, noise, optimizer, next_batch, amp_dtype
+            loss, grad_norm = train_step_fn(
+                cfg, runner, noise, optimizer, next_batch, amp_dtype
             )
+        end_events[step].record()
 
         # device-to-device writes: no sync
         losses[step] = loss
         grad_norms[step] = grad_norm
 
-        end_events[step].record()
+        if cfg.profile_steps and step == profile_end - 1:
+            torch.cuda.profiler.stop()
 
     torch.cuda.set_sync_debug_mode("default")
     torch.cuda.synchronize(device)  # the run's only sync
@@ -192,38 +290,42 @@ def main(cfg: TrainConfig) -> None:
     losses_host = losses.tolist()
     grad_norms_host = grad_norms.tolist()
 
-    timed_ms = step_ms[cfg.warmup_steps:]
-    if not timed_ms:
-        print("no timed steps (steps <= warmup_steps)")
-        return
-    median_ms = statistics.median(timed_ms)
+    median_ms = statistics.median(step_ms[cfg.warmup_steps:])
     tokens_per_s = cfg.batch_size * cfg.seq_len / (median_ms / 1e3)
     peak_mem_gb = torch.cuda.max_memory_allocated(device) / 1e9
 
     print(
         f"loss {losses_host[0]:.4f} -> {losses_host[-1]:.4f} | "
         f"median step {median_ms:.1f} ms | "
-        f"{tokens_per_s:,.0f} tokens/s | peak mem {peak_mem_gb} GB"
+        f"{tokens_per_s:,.0f} tokens/s | peak mem {peak_mem_gb:.2f} GB"
     )
 
-    log_result(
-        "train_step",
-        {**asdict(cfg), "n_params": n_params},
-        median_step_ms=median_ms,
-        step_ms=step_ms,
-        tokens_per_s=tokens_per_s,
-        peak_mem_gb=peak_mem_gb,
-        losses=losses_host,
-        grad_norms=grad_norms_host,
-    )
+    env = {
+        "gpu": torch.cuda.get_device_name(device),
+        "torch": torch.__version__,
+        "n_params": n_params,
+    }
+    metrics = {
+        "median_step_ms": median_ms,
+        "tokens_per_s": tokens_per_s,
+        "peak_mem_gb": peak_mem_gb,
+        "step_ms": step_ms,
+        "losses": losses_host,
+        "grad_norms": grad_norms_host,
+    }
+    if cfg.out_dir:
+        out = Path(cfg.out_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        config = {**asdict(cfg), **env}
+        (out / "config.json").write_text(json.dumps(config, indent=2))
+        (out / "metrics.json").write_text(json.dumps(metrics))
+
+    log_result("train_step", {**asdict(cfg), "n_params": n_params}, **metrics)
 
 
 def parse_args() -> TrainConfig:
     """Every TrainConfig field becomes a --flag (bools are switches)."""
-    parser = argparse.ArgumentParser(
-        description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
+    parser = argparse.ArgumentParser()
     defaults = TrainConfig()
     for name, value in asdict(defaults).items():
         flag = "--" + name.replace("_", "-")
