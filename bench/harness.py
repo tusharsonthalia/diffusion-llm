@@ -1,7 +1,6 @@
-"""Benchmark + correctness harness (PLAN.md 0.1-0.3): bench, check, log_result."""
+"""Benchmark + correctness harness: bench, check, log_result."""
 import json
 import os
-import subprocess
 import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
@@ -76,8 +75,6 @@ def check(out: Tensor, ref: Tensor, atol: float = 1e-5, rtol: float = 1e-4) -> C
 def log_result(name: str, config: dict, timing: Timing | None = None,
                check: Check | None = None, **metrics: Any) -> None:
     """Append one run (config, timing, check, environment) to RESULTS_DIR/<name>.jsonl."""
-    git = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True,
-                         check=False).stdout.strip()
     record = {
         "time": datetime.now(UTC).isoformat(timespec="seconds"),
         "config": config,
@@ -86,7 +83,6 @@ def log_result(name: str, config: dict, timing: Timing | None = None,
         "env": {
             "gpu": torch.cuda.get_device_name() if torch.cuda.is_available() else "cpu",
             "torch": torch.__version__,
-            "git": git or None,
         },
         **metrics,
     }
