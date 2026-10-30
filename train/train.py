@@ -227,7 +227,7 @@ def main(cfg: TrainConfig) -> None:
         return draw_random_batch(tokens, cfg.batch_size, cfg.seq_len)
 
     # attention backend first
-    install_attention(cfg.attn, nvtx=cfg.nvtx_attn)
+    install_attention(cfg.attn, nvtx=cfg.nvtx_attn, block_size=cfg.block_size)
 
     model = build_model(cfg).train()
     n_params = sum(p.numel() for p in model.parameters())

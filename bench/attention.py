@@ -1,10 +1,15 @@
 from collections.abc import Callable
+from functools import partial
 
 import torch
 import torch.nn.functional as F
 from jaxtyping import Bool, Float
 from torch import Tensor
+from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
+from kernels.BlockSparseDecodeAttention import block_sparse_decode_attention
+from kernels.BlockSparseFlashAttention import BlockSparseFlashAttention
+from kernels.SplitKVDecodeAttention import split_kv_decode_attention
 from model import modules
 
 AttentionFn = Callable[..., Tensor]
@@ -26,10 +31,51 @@ def torch_sdpa(
     return F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
 
 
+_flex = torch.compile(flex_attention)
+_block_masks = {}
+
+
+def flex(q, k, v, mask=None):
+    if mask is None:
+        return _flex(q, k, v)
+    key = (mask.data_ptr(), tuple(mask.shape))
+    if key not in _block_masks:
+        def mask_mod(batch, head, q_idx, kv_idx):
+            return mask[q_idx, kv_idx]
+
+        _block_masks[key] = create_block_mask(
+            mask_mod, None, None, *mask.shape, device=mask.device)
+    return _flex(q, k, v, block_mask=_block_masks[key])
+
+
+def bsfa(q, k, v, mask=None, block_size=None):
+    """Block-sparse FlashAttention (forward + backward) on the 2n training
+    layout; it builds the mask from block_size."""
+    return BlockSparseFlashAttention.apply(q, k, v, block_size)
+
+
+def bsdfa(q, k, v, mask=None, block_size=None):
+    """Block-sparse decode attention (forward only): the last q_len
+    positions, block-causal; it builds the mask from block_size."""
+    return block_sparse_decode_attention(q, k, v, block_size)
+
+
+def split_kv(q, k, v, mask=None, block_size=None):
+    """Split-KV decode attention (forward only): bsdfa with the keys split
+    across programs, for decode steps with few queries."""
+    return split_kv_decode_attention(q, k, v, block_size)
+
+
 BACKENDS: dict[str, AttentionFn] = {
     "custom": modules.scaled_dot_product_attention,
     "sdpa": torch_sdpa,
+    "flex": flex,
+    "bsfa": bsfa,
+    "bsdfa": bsdfa,
+    "split_kv": split_kv,
 }
+# backends that ignore the mask and need the block size instead
+BLOCK_SIZE_BACKENDS = ("bsfa", "bsdfa", "split_kv")
 
 
 class _OpenRange(torch.autograd.Function):
@@ -68,9 +114,14 @@ def with_nvtx(attention: AttentionFn) -> AttentionFn:
     return annotated
 
 
-def install_attention(name: str, nvtx: bool = False) -> None:
+def install_attention(
+    name: str, nvtx: bool = False, block_size: int | None = None
+) -> None:
     """Route every attention layer through the named backend."""
     attention = BACKENDS[name]
+    if name in BLOCK_SIZE_BACKENDS:
+        assert block_size is not None, f"{name} needs block_size"
+        attention = partial(attention, block_size=block_size)
     modules.scaled_dot_product_attention = (
         with_nvtx(attention) if nvtx else attention
     )

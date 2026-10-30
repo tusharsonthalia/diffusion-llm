@@ -41,6 +41,7 @@ def sample_bd3lm(
     n_blocks: int,
     steps: int,
     kv_cache: bool = False,
+    prompt: Int[Tensor, "batch prompt"] | None = None,
 ) -> Int[Tensor, "batch seq"]:
     """Generate n_blocks blocks left to right with BD3-LM's block-by-block sampler.
 
@@ -57,16 +58,33 @@ def sample_bd3lm(
         n_blocks (int): Number of blocks; output length is n_blocks * block_size.
         steps (int): Denoising steps T per block.
         kv_cache (bool): Use the KV cache (fast) instead of re-encoding (reference).
+        prompt (Tensor | None): Shape (batch_size, P), P a multiple of
+            block_size. Treated as finished blocks; with kv_cache it is
+            prefilled in one pass.
 
     Returns:
-        Token ids of shape (batch_size, n_blocks * block_size), no [MASK] tokens.
+        Token ids of shape (batch_size, P + n_blocks * block_size), the prompt
+        first, no [MASK] tokens.
     """
     device = model.attn_mask.device
     bs, mask_index = model.block_size, model.mask_index
 
     # x holds only FINISHED blocks; the cache (if used) holds their K/V
     x = torch.empty(batch_size, 0, device=device, dtype=torch.long)
+    if prompt is not None:
+        x = prompt
     cache = KVCache.empty(model.n_layers) if kv_cache else None
+
+    # prefill: one block-causal pass gives the prompt the same K/V as
+    # committing it block by block
+    if cache is not None and x.shape[1] > 0:
+        with torch.cuda.nvtx.range("prefill"):
+            n, p = model.max_seq_len, x.shape[1]
+            model.backbone(
+                x, torch.zeros(batch_size, device=device),
+                mask=model.attn_mask[n:n + p, n:n + p],
+                positions=model.positions[:p], kv_cache=cache, store=True,
+            )
 
     for _ in range(n_blocks):
         with torch.cuda.nvtx.range("block"):
